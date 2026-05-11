@@ -2,26 +2,171 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #define MAX_FILES 32
-#define MAX_SIZE (200 * 1024 * 1024) // 200 MB (Bayt cinsinden)
+#define MAX_SIZE (200 * 1024 * 1024) // 200 MB
 
 // ASCII dosya kontrol fonksiyonu
 int is_ascii_file(const char *filename) {
-    FILE *file = fopen(filename, "rb"); // Binary modda okuyoruz ki müdahale olmasın
-    if (!file) return 0; // Dosya açılamazsa başarısız say
+    FILE *file = fopen(filename, "rb");
+    if (!file) return 0;
 
     int ch;
     while ((ch = fgetc(file)) != EOF) {
-        // ASCII standardına göre karakterler 0-127 arasında olmalıdır.
-        // NULL (0) baytı genelde metin dosyalarında olmaz, binary'ye işarettir.
         if (ch > 127 || ch == 0) {
             fclose(file);
-            return 0; // Metin dosyası değil
+            return 0;
         }
     }
     fclose(file);
-    return 1; // Başarılı, standart metin dosyası
+    return 1;
+}
+
+// .sau arşiv oluşturma fonksiyonu (-b)
+void create_archive(char *output_filename, char *input_files[], int input_count) {
+    FILE *out = fopen(output_filename, "w");
+    if (!out) {
+        printf("Hata: %s dosyasi olusturulamadi.\n", output_filename);
+        return;
+    }
+
+    int org_size = 0;
+    struct stat st;
+    char buffer[512];
+
+    for (int i = 0; i < input_count; i++) {
+        stat(input_files[i], &st);
+        int mode = st.st_mode & 0777; 
+        sprintf(buffer, "|%s,%04o,%ld|", input_files[i], mode, (long)st.st_size);
+        org_size += strlen(buffer);
+    }
+
+    fprintf(out, "%010d", org_size);
+
+    for (int i = 0; i < input_count; i++) {
+        stat(input_files[i], &st);
+        int mode = st.st_mode & 0777;
+        fprintf(out, "|%s,%04o,%ld|", input_files[i], mode, (long)st.st_size);
+    }
+
+    for (int i = 0; i < input_count; i++) {
+        FILE *in = fopen(input_files[i], "r");
+        if (in) {
+            int ch;
+            while ((ch = fgetc(in)) != EOF) {
+                fputc(ch, out);
+            }
+            fclose(in);
+        }
+    }
+
+    fclose(out);
+    printf("Dosyalar birlestirildi.\n");
+}
+
+// .sau arşivden çıkarma fonksiyonu (-a)
+void extract_archive(char *archive_name, char *target_dir) {
+    // .sau uzantısı kontrolü
+    int len = strlen(archive_name);
+    if (len < 4 || strcmp(archive_name + len - 4, ".sau") != 0) {
+        printf("Arsiv dosyasi uygunsuz veya bozuk!\n");
+        return;
+    }
+
+    FILE *in = fopen(archive_name, "r");
+    if (!in) {
+        printf("Arsiv dosyasi uygunsuz veya bozuk!\n");
+        return;
+    }
+
+    // Hedef dizin kontrolü ve oluşturma
+    if (target_dir != NULL) {
+        struct stat st = {0};
+        if (stat(target_dir, &st) == -1) {
+            mkdir(target_dir, 0777); // Dizin yoksa oluştur
+        }
+    } else {
+        target_dir = "."; // Dizin verilmezse mevcut dizin
+    }
+
+    // İlk 10 baytı oku (Organizasyon bölümü boyutu)
+    char header[11];
+    if (fread(header, 1, 10, in) != 10) {
+        printf("Arsiv dosyasi uygunsuz veya bozuk!\n");
+        fclose(in);
+        return;
+    }
+    header[10] = '\0';
+    int org_size = atoi(header);
+
+    if (org_size <= 0) {
+        printf("Arsiv dosyasi uygunsuz veya bozuk!\n");
+        fclose(in);
+        return;
+    }
+
+    // Organizasyon verisini oku
+    char *org_data = malloc(org_size + 1);
+    if (fread(org_data, 1, org_size, in) != (size_t)org_size) {
+        printf("Arsiv dosyasi uygunsuz veya bozuk!\n");
+        free(org_data);
+        fclose(in);
+        return;
+    }
+    org_data[org_size] = '\0';
+
+    // Kayıtları ayrıştır ve dosyaları oluştur
+    char *ptr = org_data;
+    char extracted_files[1024] = ""; // Çıktı mesajı için dosya isimlerini tutacağız
+
+    while (*ptr == '|') {
+        ptr++; // baştaki '|' işaretini atla
+        char filename[256];
+        int permissions;
+        long size;
+
+        // formatı oku: Dosya adı, izinler, boyut
+        if (sscanf(ptr, "%[^,],%o,%ld|", filename, &permissions, &size) != 3) {
+            break;
+        }
+
+        // mesaj için dosya ismini kaydet
+        if (strlen(extracted_files) > 0) strcat(extracted_files, ", ");
+        strcat(extracted_files, filename);
+
+        // Bir sonraki kayda atla
+        ptr = strchr(ptr, '|');
+        if (ptr) ptr++; 
+
+        // Hedef dizine dosyayı yaz
+        char filepath[1024];
+        if (strcmp(target_dir, ".") == 0) {
+            sprintf(filepath, "%s", filename);
+        } else {
+            sprintf(filepath, "%s/%s", target_dir, filename);
+        }
+
+        FILE *out = fopen(filepath, "w");
+        if (out) {
+            for (long i = 0; i < size; i++) {
+                int ch = fgetc(in);
+                if (ch != EOF) fputc(ch, out);
+            }
+            fclose(out);
+            chmod(filepath, permissions); // Dosya izinlerini geri yükle
+        }
+    }
+
+    free(org_data);
+    fclose(in);
+
+    // Başarı mesajı
+    if (strcmp(target_dir, ".") == 0) {
+        printf("Mevcut dizinde %s dosyalari acildi.\n", extracted_files);
+    } else {
+        printf("%s dizininde %s dosyalari acildi.\n", target_dir, extracted_files);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -35,7 +180,7 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1], "-b") == 0) {
         char *input_files[MAX_FILES + 1];
         int input_count = 0;
-        char *output_file = "a.sau"; // Varsayılan arşiv adı
+        char *output_file = "a.sau"; 
 
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "-o") == 0) {
@@ -64,7 +209,6 @@ int main(int argc, char *argv[]) {
         struct stat file_stat;
         
         for (int i = 0; i < input_count; i++) {
-            // 1. Dosya okuma ve boyut kontrolü
             if (stat(input_files[i], &file_stat) == 0) {
                 total_size += file_stat.st_size;
             } else {
@@ -72,10 +216,9 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
 
-            // 2. Metin (ASCII) dosyası kontrolü
             if (!is_ascii_file(input_files[i])) {
                 printf("%s giris dosyasinin formati uyumsuzdur!\n", input_files[i]);
-                return 0; // Sorunsuz bir şekilde programdan çıkılmalıdır
+                return 0; 
             }
         }
 
@@ -84,16 +227,20 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        printf("Kontrol Basarili: %d dosya isleme alindi. Toplam boyut: %ld bayt.\n", input_count, total_size);
-        printf("Olusturulacak Arsiv Dosyasi: %s\n", output_file);
-        
-        // TODO: Dosyaları .sau formatında birleştirme (İzinler ve içerik)
+        create_archive(output_file, input_files, input_count);
 
     } 
     // --- ARŞİVDEN ÇIKARMA MODU (-a) ---
     else if (strcmp(argv[1], "-a") == 0) {
-        printf("Arsivden cikarma (-a) modu baslatildi.\n");
-        // Gelecek adımlar: .sau kontrolü ve dizin/dosya çıkarma
+        if (argc < 3 || argc > 4) {
+            printf("Hata: -a parametresi en fazla 2 parametre alabilir.\n");
+            return 1;
+        }
+
+        char *archive_name = argv[2];
+        char *target_dir = (argc == 4) ? argv[3] : NULL;
+
+        extract_archive(archive_name, target_dir);
     } 
     else {
         printf("Hata: Gecersiz parametre. Lutfen -b veya -a kullanin.\n");
