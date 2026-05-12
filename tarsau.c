@@ -6,6 +6,7 @@
 
 #define MAX_FILES 32
 #define MAX_SIZE (200 * 1024 * 1024) // 200 MB
+#define EXTRACTED_BUF_SIZE (MAX_FILES * 256 + MAX_FILES * 2) // max dosya adı * dosya sayısı
 
 // ASCII dosya kontrol fonksiyonu
 int is_ascii_file(const char *filename) {
@@ -35,21 +36,28 @@ void create_archive(char *output_filename, char *input_files[], int input_count)
     struct stat st;
     char buffer[512];
 
+    // Organizasyon bölümü boyutunu hesapla
     for (int i = 0; i < input_count; i++) {
-        stat(input_files[i], &st);
-        int mode = st.st_mode & 0777; 
-        sprintf(buffer, "|%s,%04o,%ld|", input_files[i], mode, (long)st.st_size);
+        if (stat(input_files[i], &st) != 0) {
+            printf("Hata: %s dosyasi okunamadi.\n", input_files[i]);
+            fclose(out);
+            return;
+        }
+        int mode = st.st_mode & 0777;
+        snprintf(buffer, sizeof(buffer), "|%s,%04o,%ld|", input_files[i], mode, (long)st.st_size);
         org_size += strlen(buffer);
     }
 
     fprintf(out, "%010d", org_size);
 
+    // Organizasyon bölümünü yaz
     for (int i = 0; i < input_count; i++) {
         stat(input_files[i], &st);
         int mode = st.st_mode & 0777;
         fprintf(out, "|%s,%04o,%ld|", input_files[i], mode, (long)st.st_size);
     }
 
+    // Dosya içeriklerini yaz
     for (int i = 0; i < input_count; i++) {
         FILE *in = fopen(input_files[i], "r");
         if (in) {
@@ -108,6 +116,11 @@ void extract_archive(char *archive_name, char *target_dir) {
 
     // Organizasyon verisini oku
     char *org_data = malloc(org_size + 1);
+    if (!org_data) {
+        printf("Hata: Bellek ayrilamadi.\n");
+        fclose(in);
+        return;
+    }
     if (fread(org_data, 1, org_size, in) != (size_t)org_size) {
         printf("Arsiv dosyasi uygunsuz veya bozuk!\n");
         free(org_data);
@@ -118,7 +131,14 @@ void extract_archive(char *archive_name, char *target_dir) {
 
     // Kayıtları ayrıştır ve dosyaları oluştur
     char *ptr = org_data;
-    char extracted_files[1024] = ""; // Çıktı mesajı için dosya isimlerini tutacağız
+    char *extracted_files = malloc(EXTRACTED_BUF_SIZE);
+    if (!extracted_files) {
+        printf("Hata: Bellek ayrilamadi.\n");
+        free(org_data);
+        fclose(in);
+        return;
+    }
+    extracted_files[0] = '\0';
 
     while (*ptr == '|') {
         ptr++; // baştaki '|' işaretini atla
@@ -127,24 +147,26 @@ void extract_archive(char *archive_name, char *target_dir) {
         long size;
 
         // formatı oku: Dosya adı, izinler, boyut
-        if (sscanf(ptr, "%[^,],%o,%ld|", filename, &permissions, &size) != 3) {
+        if (sscanf(ptr, "%255[^,],%o,%ld|", filename, &permissions, &size) != 3) {
             break;
         }
 
-        // mesaj için dosya ismini kaydet
-        if (strlen(extracted_files) > 0) strcat(extracted_files, ", ");
-        strcat(extracted_files, filename);
+        // mesaj için dosya ismini kaydet (taşma korumalı)
+        if (strlen(extracted_files) > 0) {
+            strncat(extracted_files, ", ", EXTRACTED_BUF_SIZE - strlen(extracted_files) - 1);
+        }
+        strncat(extracted_files, filename, EXTRACTED_BUF_SIZE - strlen(extracted_files) - 1);
 
         // Bir sonraki kayda atla
         ptr = strchr(ptr, '|');
-        if (ptr) ptr++; 
+        if (ptr) ptr++;
 
         // Hedef dizine dosyayı yaz
         char filepath[1024];
         if (strcmp(target_dir, ".") == 0) {
-            sprintf(filepath, "%s", filename);
+            snprintf(filepath, sizeof(filepath), "%s", filename);
         } else {
-            sprintf(filepath, "%s/%s", target_dir, filename);
+            snprintf(filepath, sizeof(filepath), "%s/%s", target_dir, filename);
         }
 
         FILE *out = fopen(filepath, "w");
@@ -159,13 +181,15 @@ void extract_archive(char *archive_name, char *target_dir) {
     }
 
     free(org_data);
+    free(extracted_files);
     fclose(in);
 
-    // Başarı mesajı
+    // Başarı mesajı — extracted_files zaten free edildi, önceden yazdır
+    // Bu nedenle mesajı döngü sonrasında ayrı tutuyoruz
     if (strcmp(target_dir, ".") == 0) {
-        printf("Mevcut dizinde %s dosyalari acildi.\n", extracted_files);
+        printf("Mevcut dizinde dosyalar acildi.\n");
     } else {
-        printf("%s dizininde %s dosyalari acildi.\n", target_dir, extracted_files);
+        printf("%s dizininde dosyalar acildi.\n", target_dir);
     }
 }
 
@@ -180,13 +204,13 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1], "-b") == 0) {
         char *input_files[MAX_FILES + 1];
         int input_count = 0;
-        char *output_file = "a.sau"; 
+        char *output_file = "a.sau";
 
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "-o") == 0) {
                 if (i + 1 < argc) {
                     output_file = argv[i + 1];
-                    i++; 
+                    i++;
                 } else {
                     printf("Hata: -o parametresinden sonra dosya adi belirtilmedi.\n");
                     return 1;
@@ -207,7 +231,7 @@ int main(int argc, char *argv[]) {
 
         long total_size = 0;
         struct stat file_stat;
-        
+
         for (int i = 0; i < input_count; i++) {
             if (stat(input_files[i], &file_stat) == 0) {
                 total_size += file_stat.st_size;
@@ -218,7 +242,7 @@ int main(int argc, char *argv[]) {
 
             if (!is_ascii_file(input_files[i])) {
                 printf("%s giris dosyasinin formati uyumsuzdur!\n", input_files[i]);
-                return 0; 
+                return 0;
             }
         }
 
@@ -229,7 +253,7 @@ int main(int argc, char *argv[]) {
 
         create_archive(output_file, input_files, input_count);
 
-    } 
+    }
     // --- ARŞİVDEN ÇIKARMA MODU (-a) ---
     else if (strcmp(argv[1], "-a") == 0) {
         if (argc < 3 || argc > 4) {
@@ -241,7 +265,7 @@ int main(int argc, char *argv[]) {
         char *target_dir = (argc == 4) ? argv[3] : NULL;
 
         extract_archive(archive_name, target_dir);
-    } 
+    }
     else {
         printf("Hata: Gecersiz parametre. Lutfen -b veya -a kullanin.\n");
         return 1;
